@@ -57,6 +57,18 @@ type qrChannel struct {
 	closed    uint32
 	output    chan<- QRChannelItem
 	stopQRs   chan struct{}
+	// socket stores a reference to the socket at the time the QR channel was created.
+	// This is used to prevent disconnecting a new connection if the QR channel outlives the original connection.
+	socket interface{}
+}
+
+// shouldDisconnect checks if the QR channel should disconnect the client.
+// It returns false if a new connection has been established since the QR channel was created.
+func (qrc *qrChannel) shouldDisconnect() bool {
+	qrc.cli.socketLock.RLock()
+	defer qrc.cli.socketLock.RUnlock()
+	// Only disconnect if the socket hasn't changed (i.e., no new connection was made)
+	return qrc.socket == qrc.cli.socket
 }
 
 func (qrc *qrChannel) emitQRs(codes []string) {
@@ -64,17 +76,31 @@ func (qrc *qrChannel) emitQRs(codes []string) {
 	for {
 		if len(codes) == 0 {
 			if atomic.CompareAndSwapUint32(&qrc.closed, 0, 1) {
-				qrc.log.Debugf("Ran out of QR codes, closing channel with status %s and disconnecting client", QRChannelTimeout)
+				qrc.log.Debugf("Ran out of QR codes, closing channel with status %s", QRChannelTimeout)
 				qrc.output <- QRChannelTimeout
 				close(qrc.output)
 				go qrc.cli.RemoveEventHandler(qrc.handlerID)
-				qrc.cli.Disconnect()
+				if qrc.shouldDisconnect() {
+					qrc.log.Debugf("Disconnecting client after QR timeout")
+					qrc.cli.Disconnect()
+				} else {
+					qrc.log.Debugf("Not disconnecting client after QR timeout, socket has changed (new connection likely established)")
+				}
 			} else {
 				qrc.log.Debugf("Ran out of QR codes, but channel is already closed")
 			}
 			return
 		} else if atomic.LoadUint32(&qrc.closed) == 1 {
 			qrc.log.Debugf("QR code channel is closed, exiting QR emitter")
+			return
+		} else if !qrc.shouldDisconnect() {
+			// Socket has changed, this QR channel is stale, exit early
+			qrc.log.Debugf("Socket has changed, exiting QR emitter early")
+			if atomic.CompareAndSwapUint32(&qrc.closed, 0, 1) {
+				qrc.output <- QRChannelTimeout
+				close(qrc.output)
+				go qrc.cli.RemoveEventHandler(qrc.handlerID)
+			}
 			return
 		}
 		timeout := 20 * time.Second
@@ -90,7 +116,9 @@ func (qrc *qrChannel) emitQRs(codes []string) {
 			if atomic.CompareAndSwapUint32(&qrc.closed, 0, 1) {
 				close(qrc.output)
 				go qrc.cli.RemoveEventHandler(qrc.handlerID)
-				qrc.cli.Disconnect()
+				if qrc.shouldDisconnect() {
+					qrc.cli.Disconnect()
+				}
 			}
 			return
 		}
@@ -104,7 +132,9 @@ func (qrc *qrChannel) emitQRs(codes []string) {
 			if atomic.CompareAndSwapUint32(&qrc.closed, 0, 1) {
 				close(qrc.output)
 				go qrc.cli.RemoveEventHandler(qrc.handlerID)
-				qrc.cli.Disconnect()
+				if qrc.shouldDisconnect() {
+					qrc.cli.Disconnect()
+				}
 			}
 		}
 	}
@@ -168,12 +198,21 @@ func (cli *Client) GetQRChannel(ctx context.Context) (<-chan QRChannelItem, erro
 		return nil, ErrQRStoreContainsID
 	}
 	ch := make(chan QRChannelItem, 8)
+	
+	// Capture the current socket (or nil if not connected yet) to prevent
+	// this QR channel from disconnecting a new connection established after
+	// this QR channel times out.
+	cli.socketLock.RLock()
+	currentSocket := cli.socket
+	cli.socketLock.RUnlock()
+	
 	qrc := qrChannel{
 		output:  ch,
 		stopQRs: make(chan struct{}),
 		cli:     cli,
 		log:     cli.Log.Sub("QRChannel"),
 		ctx:     ctx,
+		socket:  currentSocket,
 	}
 	qrc.handlerID = cli.AddEventHandler(qrc.handleEvent)
 	return ch, nil
